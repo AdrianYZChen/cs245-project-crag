@@ -78,8 +78,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--model_name", type=str, default="vanilla_baseline",
                         choices=["vanilla_baseline",
-                                 "rag_baseline"
-                                 # add your model here
+                                 "rag_baseline",
+                                 "rag_ours",
                                  ],
                         )
 
@@ -90,15 +90,29 @@ if __name__ == "__main__":
                                  ])
     parser.add_argument("--is_server", action="store_true", default=False,
                         help="Whether we use vLLM deployed on a server or offline inference.")
-    parser.add_argument("--vllm_server", type=str, default="http://localhost:8088/v1",
+    parser.add_argument("--vllm_server", type=str, default=None,
                         help="URL of the vLLM server if is_server is True. The port number may vary.")
     parser.add_argument("--max_retries", type=int, default=10,
                         help="Number of retries for evaluation per query.")
-
+    parser.add_argument("--gpu", type=str, default=None,
+                        help="GPU to use for inference. If None, the GPU will be automatically selected.")
+    parser.add_argument("--timestamp", type=str, default=None,
+                        help="Timestamp of specific experiment to evaluate. If None, uses latest experiment.")
 
     args = parser.parse_args()
-    print(args.is_server)
 
+    # Set gpu
+    if args.gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    
+    # Set openai api key
+    os.environ["OPENAI_API_KEY"] = None
+
+    # Initialize Ray with a temp dir since default temp dir is inaccessable
+    import tempfile
+    import ray
+    ray.init(_temp_dir=tempfile.gettempdir())
+    
     dataset_path = args.dataset_path
     dataset = dataset_path.split("/")[0]
     dataset_path = os.path.join("..", dataset_path)
@@ -111,20 +125,35 @@ if __name__ == "__main__":
     eval_model = EvaluationModel(llm_name=llm_name, is_server=args.is_server,
                                  vllm_server=args.vllm_server, max_retries=args.max_retries)
 
-
-    # get output directory
+    # Get output directory
     model_name = args.model_name
-    output_directory = os.path.join("..", "output", dataset, model_name, _llm_name)
-    if not os.path.exists(output_directory):
-        raise FileNotFoundError(f"Output directory {output_directory} does not exist.")
+    base_directory = os.path.join("..", "output", dataset, model_name, _llm_name)
+    if not os.path.exists(base_directory):
+        raise FileNotFoundError(f"Base directory {base_directory} does not exist.")
 
-    # load predictions
+    if args.timestamp:
+        # Use specified timestamp
+        output_directory = os.path.join(base_directory, args.timestamp)
+        if not os.path.exists(output_directory):
+            raise FileNotFoundError(f"Experiment directory {output_directory} does not exist.")
+    else:
+        # Find latest experiment
+        timestamps = sorted([d for d in os.listdir(base_directory) if os.path.isdir(os.path.join(base_directory, d))])
+        if not timestamps:
+            raise FileNotFoundError(f"No experiments found in {base_directory}")
+        output_directory = os.path.join(base_directory, timestamps[-1])
+
+    # Load config
+    if model_name == "rag_ours":
+        config = json.load(open(os.path.join(output_directory, "config.json"), "r"))
+    
+    # Load predictions
     predictions_file = os.path.join(output_directory, "predictions.json")
     results = json.load(open(predictions_file))
 
     # Evaluate predictions
     evaluation_results, llm_evaluation_logs = evaluate_predictions(results, eval_model)
 
-    # save evaluation_results
+    # Save evaluation results
     json.dump(evaluation_results, open(os.path.join(output_directory, "evaluation_results.json"), "w"), indent=4)
     json.dump(llm_evaluation_logs, open(os.path.join(output_directory, "llm_evaluation_logs.json"), "w"), indent=4)

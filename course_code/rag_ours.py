@@ -6,13 +6,14 @@ import numpy as np
 import ray
 import torch
 import vllm
-from blingfire import text_to_sentences_and_offsets
-from bs4 import BeautifulSoup
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
 from openai import OpenAI
 
 from tqdm import tqdm
+
+from rag_baseline import ChunkExtractor
 
 #### CONFIG PARAMETERS ---
 
@@ -35,115 +36,27 @@ SENTENTENCE_TRANSFORMER_BATCH_SIZE = 32 # TUNE THIS VARIABLE depending on the si
 
 #### CONFIG PARAMETERS END---
 
-class ChunkExtractor:
-
-    @ray.remote
-    def _extract_chunks(self, interaction_id, html_source):
-        """
-        Extracts and returns chunks from given HTML source.
-
-        Note: This function is for demonstration purposes only.
-        We are treating an independent sentence as a chunk here,
-        but you could choose to chunk your text more cleverly than this.
-
-        Parameters:
-            interaction_id (str): Interaction ID that this HTML source belongs to.
-            html_source (str): HTML content from which to extract text.
-
-        Returns:
-            Tuple[str, List[str]]: A tuple containing the interaction ID and a list of sentences extracted from the HTML content.
-        """
-        # Parse the HTML content using BeautifulSoup
-        soup = BeautifulSoup(html_source, "lxml")
-        text = soup.get_text(" ", strip=True)  # Use space as a separator, strip whitespaces
-
-        if not text:
-            # Return a list with empty string when no text is extracted
-            return interaction_id, [""]
-
-        # Extract offsets of sentences from the text
-        _, offsets = text_to_sentences_and_offsets(text)
-
-        # Initialize a list to store sentences
-        chunks = []
-
-        # Iterate through the list of offsets and extract sentences
-        for start, end in offsets:
-            # Extract the sentence and limit its length
-            sentence = text[start:end][:MAX_CONTEXT_SENTENCE_LENGTH]
-            chunks.append(sentence)
-
-        return interaction_id, chunks
-
-    def extract_chunks(self, batch_interaction_ids, batch_search_results):
-        """
-        Extracts chunks from given batch search results using parallel processing with Ray.
-
-        Parameters:
-            batch_interaction_ids (List[str]): List of interaction IDs.
-            batch_search_results (List[List[Dict]]): List of search results batches, each containing HTML text.
-
-        Returns:
-            Tuple[np.ndarray, np.ndarray]: A tuple containing an array of chunks and an array of corresponding interaction IDs.
-        """
-        # Setup parallel chunk extraction using ray remote
-        ray_response_refs = [
-            self._extract_chunks.remote(
-                self,
-                interaction_id=batch_interaction_ids[idx],
-                html_source=html_text["page_result"]
-            )
-            for idx, search_results in enumerate(batch_search_results)
-            for html_text in search_results
-        ]
-
-        # Wait until all sentence extractions are complete
-        # and collect chunks for every interaction_id separately
-        chunk_dictionary = defaultdict(list)
-
-        for response_ref in ray_response_refs:
-            interaction_id, _chunks = ray.get(response_ref)  # Blocking call until parallel execution is complete
-            chunk_dictionary[interaction_id].extend(_chunks)
-
-        # Flatten chunks and keep a map of corresponding interaction_ids
-        chunks, chunk_interaction_ids = self._flatten_chunks(chunk_dictionary)
-
-        return chunks, chunk_interaction_ids
-
-    def _flatten_chunks(self, chunk_dictionary):
-        """
-        Flattens the chunk dictionary into separate lists for chunks and their corresponding interaction IDs.
-
-        Parameters:
-            chunk_dictionary (defaultdict): Dictionary with interaction IDs as keys and lists of chunks as values.
-
-        Returns:
-            Tuple[np.ndarray, np.ndarray]: A tuple containing an array of chunks and an array of corresponding interaction IDs.
-        """
-        chunks = []
-        chunk_interaction_ids = []
-
-        for interaction_id, _chunks in chunk_dictionary.items():
-            # De-duplicate chunks within the scope of an interaction ID
-            unique_chunks = list(set(_chunks))
-            chunks.extend(unique_chunks)
-            chunk_interaction_ids.extend([interaction_id] * len(unique_chunks))
-
-        # Convert to numpy arrays for convenient slicing/masking operations later
-        chunks = np.array(chunks)
-        chunk_interaction_ids = np.array(chunk_interaction_ids)
-
-        return chunks, chunk_interaction_ids
-
-class RAGModel:
+class RAGModelOurs:
     """
     An example RAGModel for the KDDCup 2024 Meta CRAG Challenge
     which includes all the key components of a RAG lifecycle.
     """
-    def __init__(self, llm_name="meta-llama/Llama-3.2-3B-Instruct", is_server=False, vllm_server=None):
+    def __init__(
+        self, 
+        llm_name="meta-llama/Llama-3.2-3B-Instruct", 
+        is_server=False, 
+        vllm_server=None, 
+        use_rephrase=False, 
+        bm25_score_ratio=0.0, 
+        use_scores_for_prompt=False,
+    ):
         self.initialize_models(llm_name, is_server, vllm_server)
         self.chunk_extractor = ChunkExtractor()
-
+        
+        self.use_rephrase = use_rephrase
+        self.bm25_score_ratio = bm25_score_ratio
+        self.use_scores_for_prompt = use_scores_for_prompt
+        
     def initialize_models(self, llm_name, is_server, vllm_server):
         self.llm_name = llm_name
         self.master_cache_dir = "/local2/shared_cache_huggingface"
@@ -221,6 +134,37 @@ class RAGModel:
         self.batch_size = AICROWD_SUBMISSION_BATCH_SIZE  
         return self.batch_size
 
+    def rephrase_queries(self, queries: List[str]) -> List[str]:
+        messages = [
+            {"role": "system", 
+             "content": """You are a search query optimization expert. Rephrase questions to:
+             1. Include key entities and concepts
+             2. Remove unnecessary words
+             3. Make implicit context explicit
+             4. Break complex queries into key aspects
+             Keep responses concise and focused."""},
+            {"role": "user", 
+             "content": "Rephrase these questions:\n" + "\n".join([f"{i+1}. {query}" for i, query in enumerate(queries)])}
+        ]
+        
+        try:
+            openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Get API key from environment
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini", 
+                messages=messages,
+                temperature=0.2,  # Lower temperature for more focused responses
+                max_tokens=100 * len(queries)
+            )
+            rephrased_queries = response.choices[0].message.content.strip().split("\n")
+            # Remove numbering from rephrased queries
+            rephrased_queries = [q.split(". ", 1)[1] if ". " in q else q for q in rephrased_queries]
+            
+            return rephrased_queries
+        except:
+            # Fallback to original queries if API call fails
+            print(f"Failed to rephrase queries: {queries}")
+            return queries
+
     def batch_generate_answer(self, batch: Dict[str, Any]) -> List[str]:
         """
         Generates answers for a batch of queries using associated (pre-cached) search results and query times.
@@ -260,11 +204,20 @@ class RAGModel:
 
         # Calculate embeddings for queries
         query_embeddings = self.calculate_embeddings(queries)
+        
+        # Calculate rephrased queries if needed
+        if self.use_rephrase:
+            rephrased_queries = self.rephrase_queries(queries)
+            query_embeddings = self.calculate_embeddings(rephrased_queries)
 
         # Retrieve top matches for the whole batch
         batch_retrieval_results = []
+        cosine_scores = []
+        bm25_scores = []
         for _idx, interaction_id in enumerate(batch_interaction_ids):
             query = queries[_idx]
+            if self.use_rephrase:
+                rephrased_query = rephrased_queries[_idx]
             query_time = query_times[_idx]
             query_embedding = query_embeddings[_idx]
 
@@ -276,19 +229,33 @@ class RAGModel:
             relevant_chunks_embeddings = chunk_embeddings[relevant_chunks_mask]
 
             # Calculate cosine similarity between query and chunk embeddings,
-            cosine_scores = (relevant_chunks_embeddings * query_embedding).sum(1)
+            cosine_scores.append((relevant_chunks_embeddings * query_embedding).sum(1))
+            
+            # Calculate BM25 scores
+            corpus = [chunk.split() for chunk in relevant_chunks]
+            bm25 = BM25Okapi(corpus)
+            if self.use_rephrase:
+                bm25_scores.append(np.array(bm25.get_scores(rephrased_query.split())))
+            else:
+                bm25_scores.append(np.array(bm25.get_scores(query.split())))
+
+            # Combine cosine and BM25 scores
+            weighted_scores = (1 - self.bm25_score_ratio) * cosine_scores[_idx] + self.bm25_score_ratio * bm25_scores[_idx]
 
             # and retrieve top-N results.
             retrieval_results = relevant_chunks[
-                (-cosine_scores).argsort()[:NUM_CONTEXT_SENTENCES]
+                (-weighted_scores).argsort()[:NUM_CONTEXT_SENTENCES]
             ]
             
             # You might also choose to skip the steps above and 
             # use a vectorDB directly.
             batch_retrieval_results.append(retrieval_results)
             
-        # Prepare formatted prompts from the LLM        
-        formatted_prompts = self.format_prompts(queries, query_times, batch_retrieval_results)
+        # Prepare formatted prompts from the LLM
+        formatted_prompts = self.format_prompts(
+            queries, query_times, batch_retrieval_results, 
+            use_scores=self.use_scores_for_prompt, cosine_scores=cosine_scores, bm25_scores=bm25_scores
+        )
 
         # Generate responses via vllm
         # note that here self.batch_size = 1
@@ -321,7 +288,8 @@ class RAGModel:
 
         return answers
 
-    def format_prompts(self, queries, query_times, batch_retrieval_results=[]):
+    def format_prompts(self, queries, query_times, batch_retrieval_results=[], 
+                       use_scores=False, cosine_scores=None, bm25_scores=None):
         """
         Formats queries, corresponding query_times and retrieval results using the chat_template of the model.
             
@@ -329,10 +297,29 @@ class RAGModel:
         - queries (List[str]): A list of queries to be formatted into prompts.
         - query_times (List[str]): A list of query_time strings corresponding to each query.
         - batch_retrieval_results (List[str])
+        - use_scores (bool): Whether to use cosine and BM25 scores to determine the relevance of the references to the question.
+        - cosine_scores (List[float]): A list of cosine scores corresponding to each query.
+        - bm25_scores (List[float]): A list of BM25 scores corresponding to each query.
         """        
-        system_prompt = "You are provided with a question and various references. Your task is to answer the question succinctly, using the fewest words possible. If the references do not contain the necessary information to answer the question, respond with 'I don't know'. There is no need to explain the reasoning behind your answers."
-        formatted_prompts = []
+        
+        if use_scores:
+            assert cosine_scores is not None and bm25_scores is not None
+            assert len(cosine_scores) == len(bm25_scores) == len(batch_retrieval_results)
 
+        system_prompt = """
+            You are provided with a question and various references. 
+            Your task is to answer the question succinctly, using the fewest words possible. 
+            If the question is not well-defined or does not make sense, respond with 'invalid question'.
+            If the references do not contain the necessary information to answer the question, respond with 'I don't know'. 
+            There is no need to explain the reasoning behind your answers.
+        """
+        if use_scores:
+            system_prompt += """
+                You are also provided with the cosine and BM25 scores between the query and the references. 
+                Use these scores to determine the relevance of the references to the question.
+            """
+        formatted_prompts = []
+        
         for _idx, query in enumerate(queries):
             query_time = query_times[_idx]
             retrieval_results = batch_retrieval_results[_idx]
@@ -343,14 +330,17 @@ class RAGModel:
             if len(retrieval_results) > 0:
                 references += "# References \n"
                 # Format the top sentences as references in the model's prompt template.
-                for _snippet_idx, snippet in enumerate(retrieval_results):
-                    references += f"- {snippet.strip()}\n"
+                if use_scores:
+                    for _snippet_idx, (snippet, cosine_score, bm25_score) in enumerate(zip(retrieval_results, cosine_scores[_idx], bm25_scores[_idx])):
+                        references += f"- {snippet.strip()}\n- Cosine Score: {cosine_score:.4f}, BM25 Score: {bm25_score:.4f}\n"
+                else:
+                    for _snippet_idx, snippet in enumerate(retrieval_results):
+                        references += f"- {snippet.strip()}\n"
             
             references = references[:MAX_CONTEXT_REFERENCES_LENGTH]
             # Limit the length of references to fit the model's input size.
 
             user_message += f"{references}\n------\n\n"
-            user_message 
             user_message += f"Using only the references listed above, answer the following question: \n"
             user_message += f"Current Time: {query_time}\n"
             user_message += f"Question: {query}\n"

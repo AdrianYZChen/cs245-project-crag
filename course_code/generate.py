@@ -92,8 +92,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--model_name", type=str, default="vanilla_baseline",
                         choices=["vanilla_baseline",
-                                 "rag_baseline"
-                                 # add your model here
+                                 "rag_baseline",
+                                 "rag_ours",
                                  ],
                         )
 
@@ -106,10 +106,23 @@ if __name__ == "__main__":
                         help="Whether we use vLLM deployed on a server or offline inference.")
     parser.add_argument("--vllm_server", type=str, default="http://localhost:8088/v1",
                         help="URL of the vLLM server if is_server is True. The port number may vary.")
-
+    parser.add_argument("--gpu", type=str, default=None,
+                        help="GPU to use for inference. If None, the GPU will be automatically selected.")
     args = parser.parse_args()
-    print(args.is_server)
 
+    # Set gpu
+    if args.gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    
+    # Set openai api key
+    os.environ["OPENAI_API_KEY"] = None
+
+    # Initialize Ray with a temp dir since default temp dir is inaccessable
+    import tempfile
+    import ray
+    ray.init(_temp_dir=tempfile.gettempdir())
+
+    # Load dataset
     dataset_path = args.dataset_path
     dataset = dataset_path.split("/")[0]
     split = -1
@@ -120,6 +133,7 @@ if __name__ == "__main__":
                              "0 for public validation set, 1 for public test set.")
     dataset_path = os.path.join("..", dataset_path)
 
+    # Load model
     llm_name = args.llm_name
     _llm_name = llm_name.split("/")[-1]
     
@@ -130,18 +144,24 @@ if __name__ == "__main__":
     elif model_name == "rag_baseline":
         from rag_baseline import RAGModel
         model = RAGModel(llm_name=llm_name, is_server=args.is_server, vllm_server=args.vllm_server)
-    # elif model_name == "your_model":
-    #     add your model here
+    elif model_name == "rag_ours":
+        from rag_ours import RAGModelOurs
+        config = json.load(open("rag_ours_config.json", "r"))
+        print("Generating predictions with config: ", config)
+        model = RAGModelOurs(llm_name=llm_name, is_server=args.is_server, vllm_server=args.vllm_server, **config)
     else:
         raise ValueError("Model name not recognized.")
 
-    # make output directory
-    output_directory = os.path.join("..", "output", dataset, model_name, _llm_name)
+    # Make output directory with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_directory = os.path.join("..", "output", dataset, model_name, _llm_name, timestamp)
     os.makedirs(output_directory, exist_ok=True)
+    if model_name == "rag_ours":
+        json.dump(config, open(os.path.join(output_directory, "config.json"), "w"), indent=4)
 
     # Generate predictions
     queries, ground_truths, predictions = generate_predictions(dataset_path, model, split)
 
-    # save predictions
+    # Save predictions
     json.dump({"queries": queries, "ground_truths": ground_truths, "predictions": predictions},
               open(os.path.join(output_directory, "predictions.json"), "w"), indent=4)

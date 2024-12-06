@@ -34,7 +34,7 @@ class EvaluationModel:
 
         if self.is_server:
             # initialize the model with vllm server
-            openai_api_key = "EMPTY"
+            openai_api_key = os.environ["OPENAI_API_KEY"]
             openai_api_base = self.vllm_server
             self.llm_client = OpenAI(
                 api_key=openai_api_key,
@@ -88,7 +88,7 @@ class EvaluationModel:
         # note that here self.batch_size = 1
         if self.is_server:
             response = self.llm_client.chat.completions.create(
-                    model = self.llm_name,
+                    model = 'gpt-4o',
                     messages = formatted_prompts[0],
                     n=1,  # Number of output sequences to return for each prompt.
                     top_p=0.9,  # Float that controls the cumulative probability of the top tokens to consider.
@@ -158,7 +158,7 @@ class EvaluationModel:
             try:
                 if self.is_server:
                     response = self.llm_client.chat.completions.create(
-                        model=self.llm_name,
+                        model='gpt-4o',
                         messages=formatted_prompts[0]
                     )
                     answers = [response.choices[0].message.content]
