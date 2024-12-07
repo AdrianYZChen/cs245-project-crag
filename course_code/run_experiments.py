@@ -41,11 +41,12 @@ def run_experiment(config: Dict) -> None:
         "--dataset_path", config["dataset_path"],
         "--model_name", config["model_name"],
         "--llm_name", config["llm_name"],
+        "--timestamp", timestamp,
     ]
     
     if config.get("split") is not None:
         generate_cmd.extend(["--split", str(config["split"])])
-    if config.get("is_server"):
+    if config.get("generate_is_server"):
         generate_cmd.append("--is_server")
     if config.get("vllm_server"):
         generate_cmd.extend(["--vllm_server", config["vllm_server"]])
@@ -64,7 +65,7 @@ def run_experiment(config: Dict) -> None:
         "--timestamp", timestamp,
     ]
     
-    if config.get("is_server"):
+    if config.get("evaluate_is_server"):
         evaluate_cmd.append("--is_server")
     if config.get("vllm_server"):
         evaluate_cmd.extend(["--vllm_server", config["vllm_server"]])
@@ -83,7 +84,8 @@ def main():
             "model_name": "rag_ours",
             "llm_name": "meta-llama/Llama-3.2-3B-Instruct",
             "split": 1,
-            "is_server": True,
+            "generate_is_server": False,
+            "evaluate_is_server": True,
             "gpu": "0",
             "rag_config": {
                 "use_rephrase": use_rephrase,
@@ -92,7 +94,7 @@ def main():
             }
         }
         for use_rephrase in [True, False]
-        for bm25_score_ratio in [0.0, 0.3]
+        for bm25_score_ratio in [0.1, 0.0]
         for use_scores_for_prompt in [True, False]
     ]
     

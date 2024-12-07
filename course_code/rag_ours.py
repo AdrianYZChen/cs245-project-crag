@@ -260,16 +260,18 @@ class RAGModelOurs:
         # Generate responses via vllm
         # note that here self.batch_size = 1
         if self.is_server:
-            response = self.llm_client.chat.completions.create(
-                model=self.llm_name,
-                messages=formatted_prompts[0],
-                n=1,  # Number of output sequences to return for each prompt.
-                top_p=0.9,  # Float that controls the cumulative probability of the top tokens to consider.
-                temperature=0.1,  # randomness of the sampling
-                # skip_special_tokens=True,  # Whether to skip special tokens in the output.
-                max_tokens=50,  # Maximum number of tokens to generate per output sequence.
-            )
-            answers = [response.choices[0].message.content]
+            answers = []
+            for prompt in formatted_prompts:
+                response = self.llm_client.chat.completions.create(
+                    model=self.llm_name,
+                    messages=prompt,
+                    n=1,  # Number of output sequences to return for each prompt.
+                    top_p=0.9,  # Float that controls the cumulative probability of the top tokens to consider.
+                    temperature=0.1,  # randomness of the sampling
+                    # skip_special_tokens=True,  # Whether to skip special tokens in the output.
+                    max_tokens=50,  # Maximum number of tokens to generate per output sequence.
+                )
+                answers.append(response.choices[0].message.content)
         else:
             responses = self.llm.generate(
                 formatted_prompts,
